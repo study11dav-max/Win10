@@ -70,17 +70,28 @@ jobs:
         echo "TS_IP=$ip" >> $env:GITHUB_ENV
 
     # -------------------------------
-    # 5. Restore persistent WORK folder from laptop
+    # 5. Restore WORK folder from laptop (SAFE AUTH)
     # -------------------------------
     - name: Restore WORK from laptop
       shell: powershell
       run: |
         New-Item -ItemType Directory -Path C:\WORK -Force | Out-Null
 
-        net use Z: \\${{ secrets.PERSIST_IP }}\RDP_PERSIST `
-          /user:${{ secrets.PERSIST_USER }} `
-          "${{ secrets.PERSIST_PASS }}" `
-          /persistent:no
+        $securePass = ConvertTo-SecureString "${{ secrets.PERSIST_PASS }}" -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential (
+          "${{ secrets.PERSIST_USER }}",
+          $securePass
+        )
+
+        New-PSDrive -Name Z -PSProvider FileSystem `
+          -Root "\\${{ secrets.PERSIST_IP }}\RDP_PERSIST" `
+          -Credential $cred `
+          -Persist
+
+        if (!(Test-Path Z:\)) {
+          Write-Error "SMB mount failed"
+          exit 1
+        }
 
         robocopy Z:\ C:\WORK /MIR /Z /W:2 /R:2
 
@@ -92,25 +103,27 @@ jobs:
       run: |
         $job = {
           while ($true) {
-            robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2 | Out-Null
+            if (Test-Path Z:\) {
+              robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2 | Out-Null
+            }
             Start-Sleep 300
           }
         }
         Start-Job -ScriptBlock $job | Out-Null
 
     # -------------------------------
-    # 7. Show RDP Access Details
+    # 7. Show RDP Info
     # -------------------------------
     - name: RDP Info
       shell: powershell
       run: |
         Write-Host ""
-        Write-Host "============================"
+        Write-Host "=============================="
         Write-Host "RDP ADDRESS : $env:TS_IP"
         Write-Host "USERNAME    : RDP"
         Write-Host "PASSWORD    : $env:RDP_PASS"
         Write-Host "WORK FOLDER : C:\WORK"
-        Write-Host "============================"
+        Write-Host "=============================="
         Write-Host ""
 
     # -------------------------------
@@ -125,10 +138,12 @@ jobs:
         }
 
     # -------------------------------
-    # 9. Final save (extra safety)
+    # 9. Final Save (extra safety)
     # -------------------------------
     - name: Final Save
       if: always()
       shell: powershell
       run: |
-        robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2
+        if (Test-Path Z:\) {
+          robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2
+        }
