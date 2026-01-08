@@ -9,88 +9,77 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-    # 1) Create a VNC user and random password
+    # -------------------------------
+    # 1. Create VNC user (simple password)
+    # -------------------------------
     - name: Create VNC user
       shell: bash
       run: |
-        # generate a 16-char password
-        VNC_PASS=$(python3 - <<'PY'
-import secrets, string
-alphabet = string.ascii_letters + string.digits
-print(''.join(secrets.choice(alphabet) for _ in range(16)))
-PY
-)
-        # create local user 'vncuser' (admin so you can auth)
-        sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$VNC_PASS" -admin
-        echo "VNC_USER=vncuser" >> $GITHUB_ENV
-        echo "VNC_PASS=$VNC_PASS" >> $GITHUB_ENV
+        VNC_PASS="Welcome@1"
 
-    # 2) Install Tailscale (brew first, fallback to official script)
+        sudo sysadminctl -addUser vncuser \
+          -fullName "VNC User" \
+          -password "$VNC_PASS" \
+          -admin
+
+        echo "VNC_USER=vncuser" >> "$GITHUB_ENV"
+        echo "VNC_PASS=$VNC_PASS" >> "$GITHUB_ENV"
+
+    # -------------------------------
+    # 2. Install Tailscale
+    # -------------------------------
     - name: Install Tailscale
       shell: bash
       run: |
-        if ! command -v tailscale >/dev/null 2>&1; then
-          brew install --cask tailscale || curl -fsSL https://tailscale.com/install.sh | sudo sh
-        fi
+        brew install --cask tailscale || true
         tailscale version || true
 
-    # 3) Bring Tailscale up
+    # -------------------------------
+    # 3. Connect to Tailscale
+    # -------------------------------
     - name: Tailscale Up
       shell: bash
       run: |
-        sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname=gh-vnc-${{ github.run_id }}
-        TS_IP=$(tailscale ip -4 || tailscale ip | head -n1)
-        echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+        sudo tailscale up \
+          --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+          --hostname=gh-vnc-${{ github.run_id }}
 
-    # 4) Enable Screen Sharing (Remote Management) and set VNC password
-    - name: Enable Screen Sharing (VNC) and set VNC password
+        TS_IP=$(tailscale ip -4 | head -n1)
+        echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+
+    # -------------------------------
+    # 4. Enable Screen Sharing (VNC)
+    # -------------------------------
+    - name: Enable Screen Sharing
       shell: bash
-      env:
-        VNC_PASS: ${{ env.VNC_PASS }}
       run: |
         KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
-        if [ ! -x "$KICK" ]; then
-          echo "kickstart not found; attempting to enable Screen Sharing via defaults (fallback)"
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
-        else
-          # Activate Remote Management, allow 'vncuser' with full privileges and restart agent
-          sudo "$KICK" -activate -configure -access -on -users vncuser -privs -all -restart -agent
-          # turn on legacy VNC (so non-Apple VNC clients can connect)
-          sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes
-          # set VNC password
-          sudo "$KICK" -configure -clientopts -setvncpw -vncpw "$VNC_PASS"
-        fi
+        sudo "$KICK" -activate -restart -agent
+        sudo "$KICK" -configure -access -on -users vncuser -privs -all
+        sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes
+        sudo "$KICK" -configure -clientopts -setvncpw -vncpw "$VNC_PASS"
 
-        # verify screen sharing service is running
-        if ! sudo systemsetup -getremotelogin >/dev/null 2>&1; then
-          sudo systemsetup -setremotelogin on || true
-        fi
-
-    # 5) Show connection info
+    # -------------------------------
+    # 5. Show connection info
+    # -------------------------------
     - name: VNC Info
       shell: bash
       run: |
         echo "=============================="
-        echo "TS_IP      : $TS_IP"
-        echo "VNC USER   : $VNC_USER"
-        echo "VNC PASS   : $VNC_PASS"
-        echo "CONNECT    : vnc://$TS_IP:5900  (or use macOS Screen Sharing app)"
-        echo "NOTES      : Use the 'vncuser' account for full macOS login, or supply the VNC password for legacy VNC."
+        echo "VNC IP   : $TS_IP"
+        echo "USER     : vncuser"
+        echo "PASS     : Welcome@1"
+        echo "VNC URL  : vnc://$TS_IP:5900"
         echo "=============================="
 
-    # 6) Keep job alive so you can connect
+    # -------------------------------
+    # 6. Keep session alive
+    # -------------------------------
     - name: Keep Alive
       shell: bash
       run: |
         while true; do
-          echo "[$(date -u +%FT%T%z)] KEEP-ALIVE"
+          echo "[KEEP ALIVE] $(date)"
           sleep 300
         done
-
-    # 7) Final cleanup/save (if needed)
-    - name: Final Save
-      if: always()
-      shell: bash
-      run: |
-        echo "Job ending; macOS runner will be destroyed."
