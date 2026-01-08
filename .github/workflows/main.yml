@@ -1,149 +1,96 @@
-name: Persistent RDP via Tailscale
+name: Persistent macOS VNC via Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
+  secure-vnc:
+    runs-on: macos-latest
     timeout-minutes: 3600
 
     steps:
-    # -------------------------------
-    # 1. Enable RDP
-    # -------------------------------
-    - name: Configure RDP
-      shell: powershell
+    # 1) Create a VNC user and random password
+    - name: Create VNC user
+      shell: bash
       run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-          -Name "fDenyTSConnections" -Value 0 -Force
+        # generate a 16-char password
+        VNC_PASS=$(python3 - <<'PY'
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(16)))
+PY
+)
+        # create local user 'vncuser' (admin so you can auth)
+        sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$VNC_PASS" -admin
+        echo "VNC_USER=vncuser" >> $GITHUB_ENV
+        echo "VNC_PASS=$VNC_PASS" >> $GITHUB_ENV
 
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-          -Name "UserAuthentication" -Value 0 -Force
-
-        netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-        netsh advfirewall firewall add rule name="RDP-Tailscale" `
-          dir=in action=allow protocol=TCP localport=3389
-
-        Restart-Service TermService -Force
-
-    # -------------------------------
-    # 2. Create RDP User
-    # -------------------------------
-    - name: Create RDP User
-      shell: powershell
-      run: |
-        Add-Type -AssemblyName System.Security
-        $chars = ([char[]](33..126))
-        $password = -join (Get-Random -Count 16 -InputObject $chars)
-        $secure = ConvertTo-SecureString $password -AsPlainText -Force
-
-        New-LocalUser "RDP" -Password $secure -AccountNeverExpires
-        Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
-        echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-
-    # -------------------------------
-    # 3. Install Tailscale
-    # -------------------------------
+    # 2) Install Tailscale (brew first, fallback to official script)
     - name: Install Tailscale
-      shell: powershell
+      shell: bash
       run: |
-        $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-        $out = "$env:TEMP\tailscale.msi"
-        Invoke-WebRequest $url -OutFile $out
-        Start-Process msiexec.exe -ArgumentList "/i `"$out`" /quiet /norestart" -Wait
-        Remove-Item $out -Force
+        if ! command -v tailscale >/dev/null 2>&1; then
+          brew install --cask tailscale || curl -fsSL https://tailscale.com/install.sh | sudo sh
+        fi
+        tailscale version || true
 
-    # -------------------------------
-    # 4. Connect to Tailscale
-    # -------------------------------
+    # 3) Bring Tailscale up
     - name: Tailscale Up
-      shell: powershell
+      shell: bash
       run: |
-        & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-          --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-          --hostname=gh-rdp-${{ github.run_id }}
+        sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname=gh-vnc-${{ github.run_id }}
+        TS_IP=$(tailscale ip -4 || tailscale ip | head -n1)
+        echo "TS_IP=$TS_IP" >> $GITHUB_ENV
 
-        $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-        echo "TS_IP=$ip" >> $env:GITHUB_ENV
-
-    # -------------------------------
-    # 5. Restore WORK folder from laptop (SAFE AUTH)
-    # -------------------------------
-    - name: Restore WORK from laptop
-      shell: powershell
+    # 4) Enable Screen Sharing (Remote Management) and set VNC password
+    - name: Enable Screen Sharing (VNC) and set VNC password
+      shell: bash
+      env:
+        VNC_PASS: ${{ env.VNC_PASS }}
       run: |
-        New-Item -ItemType Directory -Path C:\WORK -Force | Out-Null
+        KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
-        $securePass = ConvertTo-SecureString "${{ secrets.PERSIST_PASS }}" -AsPlainText -Force
-        $cred = New-Object System.Management.Automation.PSCredential (
-          "${{ secrets.PERSIST_USER }}",
-          $securePass
-        )
+        if [ ! -x "$KICK" ]; then
+          echo "kickstart not found; attempting to enable Screen Sharing via defaults (fallback)"
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
+        else
+          # Activate Remote Management, allow 'vncuser' with full privileges and restart agent
+          sudo "$KICK" -activate -configure -access -on -users vncuser -privs -all -restart -agent
+          # turn on legacy VNC (so non-Apple VNC clients can connect)
+          sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes
+          # set VNC password
+          sudo "$KICK" -configure -clientopts -setvncpw -vncpw "$VNC_PASS"
+        fi
 
-        New-PSDrive -Name Z -PSProvider FileSystem `
-          -Root "\\${{ secrets.PERSIST_IP }}\RDP_PERSIST" `
-          -Credential $cred `
-          -Persist
+        # verify screen sharing service is running
+        if ! sudo systemsetup -getremotelogin >/dev/null 2>&1; then
+          sudo systemsetup -setremotelogin on || true
+        fi
 
-        if (!(Test-Path Z:\)) {
-          Write-Error "SMB mount failed"
-          exit 1
-        }
-
-        robocopy Z:\ C:\WORK /MIR /Z /W:2 /R:2
-
-    # -------------------------------
-    # 6. Auto-save every 5 minutes
-    # -------------------------------
-    - name: Start auto-save job
-      shell: powershell
+    # 5) Show connection info
+    - name: VNC Info
+      shell: bash
       run: |
-        $job = {
-          while ($true) {
-            if (Test-Path Z:\) {
-              robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2 | Out-Null
-            }
-            Start-Sleep 300
-          }
-        }
-        Start-Job -ScriptBlock $job | Out-Null
+        echo "=============================="
+        echo "TS_IP      : $TS_IP"
+        echo "VNC USER   : $VNC_USER"
+        echo "VNC PASS   : $VNC_PASS"
+        echo "CONNECT    : vnc://$TS_IP:5900  (or use macOS Screen Sharing app)"
+        echo "NOTES      : Use the 'vncuser' account for full macOS login, or supply the VNC password for legacy VNC."
+        echo "=============================="
 
-    # -------------------------------
-    # 7. Show RDP Info
-    # -------------------------------
-    - name: RDP Info
-      shell: powershell
-      run: |
-        Write-Host ""
-        Write-Host "=============================="
-        Write-Host "RDP ADDRESS : $env:TS_IP"
-        Write-Host "USERNAME    : RDP"
-        Write-Host "PASSWORD    : $env:RDP_PASS"
-        Write-Host "WORK FOLDER : C:\WORK"
-        Write-Host "=============================="
-        Write-Host ""
-
-    # -------------------------------
-    # 8. Keep session alive
-    # -------------------------------
+    # 6) Keep job alive so you can connect
     - name: Keep Alive
-      shell: powershell
+      shell: bash
       run: |
-        while ($true) {
-          Write-Host "[$(Get-Date)] RDP ACTIVE"
-          Start-Sleep 300
-        }
+        while true; do
+          echo "[$(date -u +%FT%T%z)] KEEP-ALIVE"
+          sleep 300
+        done
 
-    # -------------------------------
-    # 9. Final Save (extra safety)
-    # -------------------------------
+    # 7) Final cleanup/save (if needed)
     - name: Final Save
       if: always()
-      shell: powershell
+      shell: bash
       run: |
-        if (Test-Path Z:\) {
-          robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2
-        }
+        echo "Job ending; macOS runner will be destroyed."
