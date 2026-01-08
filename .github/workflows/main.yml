@@ -1,85 +1,149 @@
-name: Persistent macOS VNC via Tailscale
+name: Persistent RDP via Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-vnc:
-    runs-on: macos-latest
+  secure-rdp:
+    runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
     # -------------------------------
-    # 1. Create VNC user (simple password)
+    # 1. Enable RDP
     # -------------------------------
-    - name: Create VNC user
-      shell: bash
+    - name: Configure RDP
+      shell: powershell
       run: |
-        VNC_PASS="Welcome@1"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+          -Name "fDenyTSConnections" -Value 0 -Force
 
-        sudo sysadminctl -addUser vncuser \
-          -fullName "VNC User" \
-          -password "$VNC_PASS" \
-          -admin
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          -Name "UserAuthentication" -Value 0 -Force
 
-        echo "VNC_USER=vncuser" >> "$GITHUB_ENV"
-        echo "VNC_PASS=$VNC_PASS" >> "$GITHUB_ENV"
+        netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+        netsh advfirewall firewall add rule name="RDP-Tailscale" `
+          dir=in action=allow protocol=TCP localport=3389
+
+        Restart-Service TermService -Force
 
     # -------------------------------
-    # 2. Install Tailscale
+    # 2. Create RDP User (RANDOM USERNAME, FIXED PASSWORD)
+    # -------------------------------
+    - name: Create RDP User
+      shell: powershell
+      run: |
+        $username = "rdp_" + ([System.Guid]::NewGuid().ToString("N").Substring(0,8))
+        $password = "Welcome@1"
+
+        $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+        New-LocalUser $username -Password $secure -AccountNeverExpires
+        Add-LocalGroupMember -Group "Administrators" -Member $username
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+        echo "RDP_USER=$username" >> $env:GITHUB_ENV
+        echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+    # -------------------------------
+    # 3. Install Tailscale
     # -------------------------------
     - name: Install Tailscale
-      shell: bash
+      shell: powershell
       run: |
-        brew install --cask tailscale || true
-        tailscale version || true
+        $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $out = "$env:TEMP\tailscale.msi"
+        Invoke-WebRequest $url -OutFile $out
+        Start-Process msiexec.exe -ArgumentList "/i `"$out`" /quiet /norestart" -Wait
+        Remove-Item $out -Force
 
     # -------------------------------
-    # 3. Connect to Tailscale
+    # 4. Connect to Tailscale
     # -------------------------------
     - name: Tailscale Up
-      shell: bash
+      shell: powershell
       run: |
-        sudo tailscale up \
-          --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
-          --hostname=gh-vnc-${{ github.run_id }}
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+          --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+          --hostname=gh-rdp-${{ github.run_id }}
 
-        TS_IP=$(tailscale ip -4 | head -n1)
-        echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+        $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+        echo "TS_IP=$ip" >> $env:GITHUB_ENV
 
     # -------------------------------
-    # 4. Enable Screen Sharing (VNC)
+    # 5. Restore WORK folder
     # -------------------------------
-    - name: Enable Screen Sharing
-      shell: bash
+    - name: Restore WORK from laptop
+      shell: powershell
       run: |
-        KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+        New-Item -ItemType Directory -Path C:\WORK -Force | Out-Null
 
-        sudo "$KICK" -activate -restart -agent
-        sudo "$KICK" -configure -access -on -users vncuser -privs -all
-        sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes
-        sudo "$KICK" -configure -clientopts -setvncpw -vncpw "$VNC_PASS"
+        $securePass = ConvertTo-SecureString "${{ secrets.PERSIST_PASS }}" -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential (
+          "${{ secrets.PERSIST_USER }}",
+          $securePass
+        )
+
+        New-PSDrive -Name Z -PSProvider FileSystem `
+          -Root "\\${{ secrets.PERSIST_IP }}\RDP_PERSIST" `
+          -Credential $cred `
+          -Persist
+
+        if (!(Test-Path Z:\)) {
+          Write-Error "SMB mount failed"
+          exit 1
+        }
+
+        robocopy Z:\ C:\WORK /MIR /Z /W:2 /R:2
 
     # -------------------------------
-    # 5. Show connection info
+    # 6. Auto-save every 5 minutes
     # -------------------------------
-    - name: VNC Info
-      shell: bash
+    - name: Start auto-save job
+      shell: powershell
       run: |
-        echo "=============================="
-        echo "VNC IP   : $TS_IP"
-        echo "USER     : vncuser"
-        echo "PASS     : Welcome@1"
-        echo "VNC URL  : vnc://$TS_IP:5900"
-        echo "=============================="
+        Start-Job {
+          while ($true) {
+            if (Test-Path Z:\) {
+              robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2 | Out-Null
+            }
+            Start-Sleep 300
+          }
+        } | Out-Null
 
     # -------------------------------
-    # 6. Keep session alive
+    # 7. Show RDP Info
+    # -------------------------------
+    - name: RDP Info
+      shell: powershell
+      run: |
+        Write-Host ""
+        Write-Host "=============================="
+        Write-Host "RDP ADDRESS : $env:TS_IP"
+        Write-Host "USERNAME    : $env:RDP_USER"
+        Write-Host "PASSWORD    : $env:RDP_PASS"
+        Write-Host "WORK FOLDER : C:\WORK"
+        Write-Host "=============================="
+        Write-Host ""
+
+    # -------------------------------
+    # 8. Keep session alive
     # -------------------------------
     - name: Keep Alive
-      shell: bash
+      shell: powershell
       run: |
-        while true; do
-          echo "[KEEP ALIVE] $(date)"
-          sleep 300
-        done
+        while ($true) {
+          Write-Host "[$(Get-Date)] RDP ACTIVE"
+          Start-Sleep 300
+        }
+
+    # -------------------------------
+    # 9. Final Save
+    # -------------------------------
+    - name: Final Save
+      if: always()
+      shell: powershell
+      run: |
+        if (Test-Path Z:\) {
+          robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2
+        }
