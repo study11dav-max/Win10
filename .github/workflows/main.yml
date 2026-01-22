@@ -71,48 +71,7 @@ jobs:
         echo "TS_IP=$ip" >> $env:GITHUB_ENV
 
     # -------------------------------
-    # 5. Restore WORK folder
-    # -------------------------------
-    - name: Restore WORK from laptop
-      shell: powershell
-      run: |
-        New-Item -ItemType Directory -Path C:\WORK -Force | Out-Null
-
-        $securePass = ConvertTo-SecureString "${{ secrets.PERSIST_PASS }}" -AsPlainText -Force
-        $cred = New-Object System.Management.Automation.PSCredential (
-          "${{ secrets.PERSIST_USER }}",
-          $securePass
-        )
-
-        New-PSDrive -Name Z -PSProvider FileSystem `
-          -Root "\\${{ secrets.PERSIST_IP }}\RDP_PERSIST" `
-          -Credential $cred `
-          -Persist
-
-        if (!(Test-Path Z:\)) {
-          Write-Error "SMB mount failed"
-          exit 1
-        }
-
-        robocopy Z:\ C:\WORK /MIR /Z /W:2 /R:2
-
-    # -------------------------------
-    # 6. Auto-save every 5 minutes
-    # -------------------------------
-    - name: Start auto-save job
-      shell: powershell
-      run: |
-        Start-Job {
-          while ($true) {
-            if (Test-Path Z:\) {
-              robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2 | Out-Null
-            }
-            Start-Sleep 300
-          }
-        } | Out-Null
-
-    # -------------------------------
-    # 7. Show RDP Info
+    # 5. Show RDP Info
     # -------------------------------
     - name: RDP Info
       shell: powershell
@@ -122,12 +81,11 @@ jobs:
         Write-Host "RDP ADDRESS : $env:TS_IP"
         Write-Host "USERNAME    : $env:RDP_USER"
         Write-Host "PASSWORD    : $env:RDP_PASS"
-        Write-Host "WORK FOLDER : C:\WORK"
         Write-Host "=============================="
         Write-Host ""
 
     # -------------------------------
-    # 8. Keep session alive
+    # 6. Keep session alive
     # -------------------------------
     - name: Keep Alive
       shell: powershell
@@ -135,15 +93,4 @@ jobs:
         while ($true) {
           Write-Host "[$(Get-Date)] RDP ACTIVE"
           Start-Sleep 300
-        }
-
-    # -------------------------------
-    # 9. Final Save
-    # -------------------------------
-    - name: Final Save
-      if: always()
-      shell: powershell
-      run: |
-        if (Test-Path Z:\) {
-          robocopy C:\WORK Z:\ /MIR /Z /W:2 /R:2
         }
